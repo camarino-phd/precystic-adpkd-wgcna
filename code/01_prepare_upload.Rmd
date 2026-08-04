@@ -1,0 +1,315 @@
+---
+title: "01 - Prepare TXG-MAPr upload; DEG counts (Table 1); volcano plots (Fig 2)"
+output: html_notebook
+---
+
+```{r global setup, include=FALSE}
+# ========== GLOBAL SETTINGS ==========
+
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  warning = FALSE, 
+  message = FALSE, 
+  fig.width = 12, 
+  fig.height = 8,
+  cache = FALSE,
+  error = FALSE,
+  eval = TRUE
+)
+
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+options(width = 100)
+options(dplyr.summarise.inform = FALSE)
+
+# ========== GLOBAL OUTPUT SETTINGS ==========
+here::i_am("code/01_prepare_upload.Rmd")  # path to THIS Rmd from project root
+
+params <- list(
+  save_outputs = TRUE,
+  results_dir = here::here("results", format(Sys.Date()))
+)
+
+if (params$save_outputs && !dir.exists(params$results_dir)) {
+  dir.create(params$results_dir, recursive = TRUE)
+}
+
+# ========== FILE PATHS ==========
+
+earlypkd_file      <- here::here("data", "earlyPKDmodels.xlsx")
+pkd1cko_file       <- here::here("data", "Pkd1cko_NoRapa_WT.xlsx")
+orthologs_rat_file <- here::here("data", "ORTHOLOGS_RAT.txt")
+
+# Load orthologs table, skipping comment lines
+orthologs <- read.delim(orthologs_rat_file, comment.char = "#", header = TRUE, sep = "\t", check.names = FALSE)
+# Deduplicate column names explicitly
+colnames(orthologs) <- make.names(colnames(orthologs), unique = TRUE)
+
+# Keep all rows, including those with missing or multiple Ensembl IDs
+ortholog_map <- orthologs %>%
+  select(
+    RAT_GENE_NCBI_GENE_ID, RAT_GENE_SYMBOL,
+    RAT_GENE_ENSEMBL_GENE_ID,
+    MOUSE_GENE_NCBI_GENE_ID, MOUSE_GENE_SYMBOL,
+    MOUSE_GENE_ENSEMBL_GENE_ID
+  )
+
+results_main <- list()
+
+# Load raw Excel data 
+
+# Load early data 
+results_main$data_early <- read_excel(earlypkd_file, sheet = "DEGs", skip = 2,
+                                      col_names = c(
+                                        "ensembl_id", "symbol", "description",
+                                        "logFC_Wk1", "FC_Wk1", "padj_Wk1",
+                                        "logFC_Wk2", "FC_Wk2", "padj_Wk2",
+                                        "logFC_Wk5", "FC_Wk5", "padj_Wk5"
+                                      ))
+
+# Load early mod-sev
+results_main$data_mod_sev <- read_excel(pkd1cko_file, sheet = "All_Genes", skip = 2,
+                                      col_names = c(
+                                        "ensembl_id", "symbol", "description",
+                                        "logFC_NoRapa_Short", "FC_NoRapa_Short", "padj_NoRapa_Short",
+                                        "logFC_NoRapa_Long", "FC_NoRapa_Long", "padj_NoRapa_Long"
+                                      ))
+
+
+# dataset reshaping
+reshape_early <- function(df) {
+  long_df <- bind_rows(
+    df %>% select(ensembl_id, symbol, log2fc = logFC_Wk1, padj = padj_Wk1) %>% mutate(experiment = "PKD_wk2", time = 1),
+    df %>% select(ensembl_id, symbol, log2fc = logFC_Wk2, padj = padj_Wk2) %>% mutate(experiment = "PKD_wk3", time = 2),
+    df %>% select(ensembl_id, symbol, log2fc = logFC_Wk5, padj = padj_Wk5) %>% mutate(experiment = "PKD_wk6", time = 3)
+  )
+  long_df %>%
+    mutate(
+      conc = 0,
+      pvalue = 0
+    ) %>%
+    rename(gene_id = ensembl_id, gene_symbol = symbol) %>%
+    select(experiment, gene_id, gene_symbol, time, conc, log2fc, pvalue, padj)
+}
+
+reshape_modsev <- function(df) {
+  long_df <- bind_rows(
+    df %>% select(ensembl_id, symbol, log2fc = logFC_NoRapa_Short, padj = padj_NoRapa_Short) %>% mutate(experiment = "PKD_Moderate", time = 4),
+    df %>% select(ensembl_id, symbol, log2fc = logFC_NoRapa_Long, padj = padj_NoRapa_Long) %>% mutate(experiment = "PKD_Advanced", time = 5)
+  )
+  long_df %>%
+    mutate(
+      conc = 0,
+      pvalue = 0
+    ) %>%
+    rename(gene_id = ensembl_id, gene_symbol = symbol) %>%
+    select(experiment, gene_id, gene_symbol, time, conc, log2fc, pvalue, padj)
+}
+
+# Full mouse-to-rat table
+txg_mapr_mouse <- bind_rows(
+  reshape_early(results_main$data_early),
+  reshape_modsev(results_main$data_mod_sev)
+) %>%
+  mutate(mouse_gene_id = gene_id)  # Keep for traceability
+
+# Step 1: Match on SYMBOL
+matched_symbol <- txg_mapr_mouse %>%
+  inner_join(ortholog_map, by = c("gene_symbol" = "MOUSE_GENE_SYMBOL"))
+
+unmatched_symbol <- anti_join(txg_mapr_mouse, matched_symbol, by = colnames(txg_mapr_mouse))
+
+
+
+
+
+
+# Step 2: Match remaining on ENSEMBL
+matched_ensembl <- unmatched_symbol %>%
+  inner_join(ortholog_map, by = c("mouse_gene_id" = "MOUSE_GENE_ENSEMBL_GENE_ID"))
+
+unmatched_ensembl <- anti_join(unmatched_symbol, matched_ensembl, by = colnames(txg_mapr_mouse))
+
+# Step 3: Match remaining on ENTREZ
+matched_entrez <- unmatched_ensembl %>%
+  mutate(mouse_gene_id_num = suppressWarnings(as.numeric(mouse_gene_id))) %>%
+  filter(!is.na(mouse_gene_id_num)) %>%
+  inner_join(ortholog_map, by = c("mouse_gene_id_num" = "MOUSE_GENE_NCBI_GENE_ID"))
+
+# Combine all mapped
+mapped_all <- bind_rows(matched_symbol, matched_ensembl, matched_entrez)
+
+
+# Final rat-formatted output
+txg_mapr_upload <- mapped_all %>%
+  mutate(gene_id = RAT_GENE_SYMBOL) %>%
+  select(experiment, gene_id, time, conc, log2fc, pvalue, padj, mouse_gene_id)
+
+# Count total and mapped rows per experiment
+total_counts <- txg_mapr_mouse %>%
+  group_by(experiment) %>%
+  summarise(total_genes = n(), .groups = "drop")
+
+mapped_counts <- txg_mapr_upload %>%
+  group_by(experiment) %>%
+  summarise(mapped_genes = n(), .groups = "drop")
+
+# Merge and compute loss stats
+mapping_stats <- total_counts %>%
+  left_join(mapped_counts, by = "experiment") %>%
+  mutate(
+    genes_lost   = total_genes - mapped_genes,
+    percent_lost = round(100 * genes_lost / total_genes, 2)
+  )
+
+print(mapping_stats)  ########################################<-<-<- this is table 1
+
+# Export final rat-formatted table (excluding mouse_gene_id from file, but not from object)
+write.table(
+  txg_mapr_upload %>% select(-mouse_gene_id),
+  file = file.path(params$results_dir, "txg_mapr_upload_rat_symbols.txt"),  ####################################<- file used to upload in the WGCNA
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+# Optional: if you want to keep intermediate versions
+# write.table(txg_mapr_mouse, file = ..., ...)
+# write.table(mapped_all, file = ..., ...)
+
+# Save ortholog map (cleaned)
+dir.create(here::here("data"), showWarnings = FALSE, recursive = TRUE)
+saveRDS(ortholog_map, file = here::here("data", "orthologs_df.rds"))
+
+
+
+# ============================
+# EXPORT: Gene mapping summary (merged) to Excel
+# ============================
+
+# Label mapping status
+mapped_all$mapping_status <- "mapped"
+unmatched_symbol$mapping_status <- "unmapped"
+
+# Match column structure and merge
+common_cols <- intersect(colnames(mapped_all), colnames(unmatched_symbol))
+merged_genes <- dplyr::bind_rows(
+  mapped_all[, c(common_cols, "mapping_status")],
+  unmatched_symbol[, c(common_cols, "mapping_status")]
+)
+
+# Recalculate unmapped directly, safely
+mapping_summary <- mapping_stats %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    unmapped_genes = total_genes - mapped_genes,
+    percent_mapped = round(100 * mapped_genes / total_genes, 2),
+    percent_unmapped = round(100 * (total_genes - mapped_genes) / total_genes, 2)
+  ) %>%
+  dplyr::ungroup()
+
+# Save output to results_dir ########################################################<--------------------- supplementary table 2
+write.xlsx(
+  x = list(
+    "Gene Mapping Status" = merged_genes,
+    "Summary by Condition" = mapping_summary
+  ),
+  file = file.path(params$results_dir, "txgmapr_gene_mapping_summary.xlsx"),
+  overwrite = TRUE
+)
+
+```
+
+```{r deg genes quantification Log2fc > 1 and padj < 0.05}
+
+# Mouse-space table built in the script: txg_mapr_mouse
+# uses gene_symbol
+deg_counts_mouse <- txg_mapr_mouse %>%
+  dplyr::group_by(experiment) %>%
+  dplyr::summarise(
+    n_genes    = dplyr::n_distinct(gene_symbol),
+    n_up_1p5   = dplyr::n_distinct(gene_symbol[log2fc >=  1 & padj < 0.05]),
+    n_down_1p5 = dplyr::n_distinct(gene_symbol[log2fc <= -1 & padj < 0.05]),
+    n_abs_1p5  = n_up_1p5 + n_down_1p5,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(experiment)
+
+
+# Save output to results_dir
+write.table(
+  deg_counts_mouse,
+  file = file.path(params$results_dir, "deg_counts_mouse.txt"),
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+```
+
+```{r}
+## Volcano plot per experiment with top 10 labels, saved to results/
+## Volcano plots: top 10 up + top 10 down per experiment (mouse only)
+## Uses: txg_mapr_mouse with columns: experiment, gene_symbol, log2fc, padj
+
+thr_logfc <- 1.5
+thr_padj  <- 0.05
+
+# ensure results dir
+results_dir <- params$results_dir
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+
+volcano_plot_two_sided_top10 <- function(df, experiment_name, gene_col = "gene_symbol") {
+  df_exp <- df %>%
+    dplyr::filter(.data$experiment == experiment_name) %>%
+    dplyr::mutate(
+      mlog10p = -log10(pmax(.data$padj, .Machine$double.xmin)),
+      sig = dplyr::case_when(
+        .data$padj < thr_padj & .data$log2fc >=  thr_logfc ~ "Up",
+        .data$padj < thr_padj & .data$log2fc <= -thr_logfc ~ "Down",
+        TRUE ~ "NS"
+      )
+    )
+
+  top_up <- df_exp %>%
+    dplyr::filter(.data$padj < thr_padj, .data$log2fc >= thr_logfc) %>%
+    dplyr::arrange(.data$padj, dplyr::desc(abs(.data$log2fc))) %>%
+    dplyr::slice_head(n = 10)
+
+  top_down <- df_exp %>%
+    dplyr::filter(.data$padj < thr_padj, .data$log2fc <= -thr_logfc) %>%
+    dplyr::arrange(.data$padj, dplyr::desc(abs(.data$log2fc))) %>%
+    dplyr::slice_head(n = 10)
+
+  top_labels <- dplyr::bind_rows(top_up, top_down)
+
+  p <- ggplot2::ggplot(df_exp, ggplot2::aes(x = .data$log2fc, y = .data$mlog10p)) +
+    ggplot2::geom_point(ggplot2::aes(color = .data$sig), alpha = 0.6, size = 1.3) +
+    ggplot2::geom_vline(xintercept = c(-thr_logfc, thr_logfc), linetype = "dashed", linewidth = 0.3, color = "grey50") +
+    ggplot2::geom_hline(yintercept = -log10(thr_padj), linetype = "dashed", linewidth = 0.3, color = "grey50") +
+    ggrepel::geom_text_repel(
+      data = top_labels,
+      ggplot2::aes(label = .data[[gene_col]]),
+      max.overlaps = Inf, box.padding = 0.3, point.padding = 0.2, min.segment.length = 0
+    ) +
+    ggplot2::scale_color_manual(values = c(Down = "#3b82f6", NS = "grey75", Up = "#ef4444")) +
+    ggplot2::labs(
+      title = paste0("Volcano: ", experiment_name),
+      x = "log2 fold change",
+      y = "-log10(adjusted p)",
+      color = NULL
+    ) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(legend.position = "top")
+
+  out_path <- file.path(results_dir, paste0("volcano_", experiment_name, "_top10eachside_1p5padj0p05.png"))
+  ggplot2::ggsave(out_path, plot = p, width = 7, height = 5, dpi = 300)
+  message("Saved: ", out_path)
+  invisible(p)
+}
+
+# run for all experiments in the mouse table
+invisible(lapply(unique(txg_mapr_mouse$experiment), function(e) {
+  volcano_plot_two_sided_top10(txg_mapr_mouse, e, gene_col = "gene_symbol")
+}))
+
+
+
+```
+
+

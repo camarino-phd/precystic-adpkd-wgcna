@@ -1,0 +1,108 @@
+---
+title: "02 - Assemble module/gene EGS matrix from TXG-MAPr output (Supplementary Table 3)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+# Standalone entry point. Run 00_environment.R first to load packages.
+# INPUT (place under data/): the unzipped TXG-MAPr download for the Pkd1 upload,
+#   data/TXG-MAPr_Results_Unzipped/moduleTable.txt
+#   data/TXG-MAPr_Results_Unzipped/geneTable.txt
+# and data/orthologs_df.rds written by 01_prepare_upload.Rmd.
+here::i_am("code/02_assemble_egs_matrix.Rmd")
+
+params <- list(results_dir = here::here("results", format(Sys.Date())))
+if (!dir.exists(params$results_dir)) dir.create(params$results_dir, recursive = TRUE)
+```
+
+
+
+```{r}
+# ========== FILE PATHS ==========
+
+orthologs_path <- here::here("data", "orthologs_df.rds")
+module_path    <- here::here("data", "TXG-MAPr_Results_Unzipped", "moduleTable.txt")
+
+orthologs_df  <- readRDS(orthologs_path)
+module_table  <- read.table(module_path, header = TRUE, sep = "\t",
+                            stringsAsFactors = FALSE, check.names = FALSE)
+
+# Drop 'sample_id', 'time', 'time_unit', 'conc_level', 'conc_unit'
+module_table_cleaned <- module_table[, !(names(module_table) %in% c(
+  "sample_id", "time", "time_unit", "conc_level", "conc_unit"
+))]
+
+# Remove 'uploadFile1_' prefix from 'experiment' column
+module_table_cleaned$experiment <- sub("^uploadFile1_", "", module_table_cleaned$experiment)
+
+
+
+
+# Summarize: number of unique modules, average % coverage, and average eigengene score
+summary_stats_module <- module_table_cleaned %>%
+  group_by(experiment) %>%
+  summarise(
+    num_modules = n_distinct(module),
+    avg_coverage_pct = mean(moduleCoveragePercetage, na.rm = TRUE),
+    avg_eg_score = mean(eg_score, na.rm = TRUE)
+  )
+
+# View result
+print(summary_stats_module)
+
+gene_path <- here::here("data", "TXG-MAPr_Results_Unzipped", "geneTable.txt")
+gene_table <- read.table(gene_path, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+gene_table <- gene_table %>%
+  mutate(
+    sample_id = sub("^uploadFile1_", "", sample_id),
+    sample_id = sub("_SINGLE_[0-9]+_0$", "", sample_id),
+    gene_symbol = sub("^id_", "", gene_symbol),
+    entrez_id = sub("^id_", "", entrez_id)
+  ) %>%
+  rename(experiment = sample_id)
+
+gene_summary <- gene_table %>%
+  group_by(experiment) %>%
+  summarise(
+    num_unique_genes = n_distinct(gene_symbol),
+    avg_genes_per_module = mean(table(module)),
+    avg_module_size = mean(module_size, na.rm = TRUE),
+    avg_coverage_pct = mean(moduleCoveragePercetage, na.rm = TRUE)
+  )
+
+print(gene_summary)
+
+
+# Merge by experiment and module
+combined_table <- gene_table %>%
+  left_join(module_table_cleaned, by = c("experiment", "module", "module_size", "moduleCoverage", "moduleCoveragePercetage")) %>%
+  relocate(eg_score, .after = module)
+
+```
+
+```{r}
+# Step 1: Ensure consistent type
+combined_table <- combined_table %>%
+  mutate(entrez_id = as.character(entrez_id))
+
+ortholog_map <- orthologs_df %>%
+  mutate(RAT_GENE_NCBI_GENE_ID = as.character(RAT_GENE_NCBI_GENE_ID))
+
+# Step 2: Join to add mouse gene annotations
+combined_mouse <- combined_table %>%
+  left_join(ortholog_map, by = c("entrez_id" = "RAT_GENE_NCBI_GENE_ID"))
+
+combined_mouse <- combined_mouse %>%
+  relocate(c(MOUSE_GENE_SYMBOL, MOUSE_GENE_NCBI_GENE_ID),
+           .after = entrez_id)
+
+   
+# Save as CSV ################################################################## <- this is supplementary table 3
+
+out_csv  <- here::here("data", "new_wgcna.csv")
+out_xlsx <- here::here("data", "new_wgcna.xlsx")
+
+write.csv(combined_mouse, file = out_csv, row.names = FALSE)
+writexl::write_xlsx(combined_mouse, path = out_xlsx)
+```

@@ -1,0 +1,1400 @@
+---
+title: '03 - Module selection, functional & TF enrichment, figures (Fig 4-6; Suppl. Tables 4-6)'
+author: "Cesare Marino"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    keep_md: true
+  pdf_document:
+    toc: true
+---
+
+```{r global setup, include=FALSE}
+# ========== GLOBAL SETTINGS ==========
+
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  warning = FALSE, 
+  message = FALSE, 
+  fig.width = 12, 
+  fig.height = 8,
+  cache = FALSE,
+  error = FALSE,
+  eval = TRUE
+)
+
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+options(width = 100)
+options(dplyr.summarise.inform = FALSE)
+
+
+# ========== GLOBAL OUTPUT SETTINGS ==========
+
+here::i_am("code/03_analysis_and_figures.Rmd")  # path to THIS Rmd from project root
+
+params <- list(
+  save_outputs = TRUE,
+  results_dir = here::here("results", format(Sys.Date()))
+)
+
+if (params$save_outputs && !dir.exists(params$results_dir)) {
+  dir.create(params$results_dir, recursive = TRUE)
+}
+
+# ========== FILE PATHS ==========
+
+wgcna_file  <- here::here("data", "new_wgcna.csv")
+trrust_file <- here::here("data", "trrust_rawdata.mouse.tsv")
+
+
+# ========== ANALYSIS PARAMETERS ==========
+
+egs_threshold_percentile <- 0.85
+min_gene_count <- 10
+min_conditions <- 2
+
+# ========== CONDITION SETS ==========
+
+condition_sets <- list(
+  early    = c("PKD_wk2", "PKD_wk3", "PKD_wk6"),
+  advanced = c("PKD_Moderate", "PKD_Advanced"),
+  combined = c("PKD_wk2", "PKD_wk3", "PKD_wk6", "PKD_Moderate", "PKD_Advanced")
+)
+
+
+# Set this to one of: "early", "advanced", "combined" or custom
+downstream_condition_set <- "early"
+
+
+# ========== UTILITY FUNCTIONS ==========
+
+clean_wgcna_data <- function(df, keep_conditions) {
+  df %>%
+    filter(experiment %in% keep_conditions) %>%
+    filter(!is.na(module)) %>%
+    transmute(
+      condition = experiment,
+      gene_id = MOUSE_GENE_SYMBOL,
+      entrez_id = MOUSE_GENE_NCBI_GENE_ID,
+      log2fc = log2fc,
+      pvalue = pvalue,
+      padj = padj,
+      module = module,
+      egs_score = eg_score
+    )
+}
+
+
+analyze_modules <- function(df, egs_percentile, min_genes, min_conds) {
+    egs_raw <- df %>%
+    select(module, condition, egs_score) %>%
+    distinct()
+  
+  if (nrow(egs_raw) > 0) {
+    egs_matrix <- egs_raw %>%
+      pivot_wider(names_from = condition, values_from = egs_score, values_fill = NA)
+  
+    # Only rename if there are columns besides 'module'
+    if (ncol(egs_matrix) > 1) {
+      egs_matrix <- egs_matrix %>%
+        rename_with(~ paste0("EGS_", .), .cols = -module)
+    }
+  } else {
+    egs_matrix <- tibble(module = character(0))
+  }
+  
+  stats <- df %>%
+    group_by(module) %>%
+    summarise(
+      gene_list = paste(unique(gene_id), collapse = ";"),
+      gene_count = n_distinct(gene_id),
+      conds_present = n_distinct(condition),
+      max_abs_egs = max(abs(egs_score), na.rm = TRUE),
+      mean_abs_egs = mean(egs_score, na.rm = TRUE),
+      sd_egs = sd(egs_score, na.rm = TRUE),
+      mean_egs = mean(egs_score, na.rm = TRUE),
+      direction = ifelse(mean_egs > 0, "Upregulated", "Downregulated"),
+      .groups = "drop"
+    ) %>%
+    left_join(egs_matrix, by = "module") %>%
+    mutate(
+      threshold_value_egs = quantile(max_abs_egs, egs_percentile, na.rm = TRUE),
+      passes_egs = max_abs_egs >= threshold_value_egs,
+      passes_size = gene_count >= min_genes,
+      passes_conditions = conds_present >= min_conds,
+      selected = passes_egs & passes_size & passes_conditions
+    ) %>%
+    arrange(desc(max_abs_egs))
+  
+  return(stats)
+}
+
+run_module_analysis <- function(condition_vector, input_data) {
+  df <- clean_wgcna_data(input_data, condition_vector)
+  stats <- analyze_modules(df, egs_threshold_percentile, min_gene_count, min_conditions)
+  sel_ids <- stats %>% filter(selected) %>% pull(module)
+
+  list(
+    data_filtered = df,
+    modules_stats = stats,
+    modules_sel_ids = sel_ids,
+    modules_selected = stats %>%
+      filter(selected) %>%
+      select(module, direction, gene_count, max_abs_egs, mean_egs),
+    modules_genes = stats %>%
+      filter(selected) %>%
+      mutate(
+        genes = strsplit(gene_list, ";"),
+        gene_count_check = gene_count
+      ) %>%
+      select(module, genes, gene_count_check)
+  )
+}
+
+```
+
+## Step 1: Module Selection and Eigengene Activity Analysis
+
+This step loads the WGCNA results and filters modules based on condition-specific eigengene scores (EGS), building the `results` object (early, advanced, combined selection sets) used by every downstream figure and table. Module selection uses the 85th-percentile EGS threshold with the minimum gene-count and condition filters; the selection thresholds are printed for the record. Figures are built in the dedicated Figure sections below.
+
+
+```{r egs_heatmaps_full, message=FALSE, warning=FALSE}
+# =============================================================================
+# FULL EGS HEATMAPS
+# =============================================================================
+
+library(pheatmap)
+library(RColorBrewer)
+library(grid)
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# — Load the new CSV 
+new_wgcna <- read_csv(wgcna_file)
+
+stopifnot(all(c("experiment","module","eg_score","gene_symbol") %in% colnames(new_wgcna)))
+
+
+# Run module selection for each group
+results <- list(
+  early    = run_module_analysis(condition_sets$early,    new_wgcna),
+  advanced = run_module_analysis(condition_sets$advanced, new_wgcna)
+)
+
+
+merge_results <- function(res1, res2) {
+  list(
+    modules_sel_ids = union(res1$modules_sel_ids, res2$modules_sel_ids),
+
+    modules_selected = bind_rows(res1$modules_selected, res2$modules_selected) %>%
+      distinct(module, .keep_all = TRUE),
+
+    modules_stats = bind_rows(res1$modules_stats, res2$modules_stats) %>%
+      distinct(module, .keep_all = TRUE),
+
+    data_filtered = bind_rows(
+      res1$data_filtered,
+      res2$data_filtered
+    ),
+
+    modules_genes = {
+      gene_col <- setdiff(names(res1$modules_genes), "module")[1]
+      bind_rows(res1$modules_genes, res2$modules_genes) %>%
+        distinct(module, .data[[gene_col]], .keep_all = TRUE)
+    }
+  )
+}
+
+results$combined <- merge_results(results$early, results$advanced)
+
+
+# Use the long-format EGS table computed in Script 3
+# Columns: condition, module, egs_score, etc.
+new_wgcna <- results$combined$data_filtered
+
+# --- EGS selection thresholds (85th percentile), kept for the record ---
+cat("egs_threshold_percentile =", egs_threshold_percentile, "\n")
+cat("EGS cutoff (early)   :", unique(results$early$modules_stats$threshold_value_egs), "\n")
+cat("EGS cutoff (advanced):", unique(results$advanced$modules_stats$threshold_value_egs), "\n")
+```
+
+## Figure 4: Module EGS heatmap and early-module top genes
+
+Figure 4 is built as two panels, each computed once and exported as a vector PDF;
+the two panels are combined manually afterwards. Panel (a) is the combined-selection
+module EGS heatmap with Early/Severe row blocks (`p_top`). Panel (b) is the top-5 genes
+per early-selected module across all conditions, colour-clamped to [-3, 3] and row-linked
+to the Early block of panel (a).
+
+### Fig 4a: module EGS heatmap (Early vs Severe)
+
+```{r fig4a_module_egs_heatmap, message=FALSE, warning=FALSE, fig.width=10, fig.height=12}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(pheatmap)
+  library(grid)
+  library(gridExtra)
+  library(gtable)
+})
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+desired_order <- c("PKD_wk2","PKD_wk3","PKD_wk6","PKD_Moderate","PKD_Advanced")
+pal_bwr <- grDevices::colorRampPalette(c("#4575b4","white","#d73027"))(100)
+
+stage_cols <- c("Severe"="#C77700","Early"="#1F78B4")
+annotation_colors_mod <- list(
+  stage = stage_cols,
+  direction = c("Upregulated"="#d73027","Downregulated"="#4575b4"),
+  activity_level = c("Very High"="#8B0000","High"="#CD5C5C","Moderate"="#F0E68C","Lower"="#D3D3D3"),
+  size_category = c("Large"="#006400","Medium"="#32CD32","Small"="#90EE90")
+)
+
+# =============================================================================
+# TOP PANEL: MODULE EGS HEATMAP (Early vs Severe blocks)
+# =============================================================================
+new_wgcna <- results$combined$data_filtered
+
+mods_early    <- results$early$modules_sel_ids
+mods_advanced <- results$advanced$modules_sel_ids
+mods_severe   <- setdiff(mods_advanced, mods_early)
+mods_all      <- results$combined$modules_sel_ids
+
+mat_mod <- new_wgcna %>%
+  filter(module %in% mods_all, condition %in% desired_order) %>%
+  mutate(condition = factor(condition, levels = desired_order)) %>%
+  select(module, condition, egs_score) %>%
+  distinct() %>%
+  pivot_wider(names_from = condition, values_from = egs_score) %>%
+  column_to_rownames("module") %>%
+  as.matrix()
+
+mat_mod <- mat_mod[, desired_order, drop = FALSE]
+mat_mod <- mat_mod[rowSums(!is.na(mat_mod)) > 0, , drop = FALSE]
+
+ann_mod <- results$combined$modules_selected %>%
+  filter(module %in% rownames(mat_mod)) %>%
+  mutate(
+    activity_level = case_when(
+      max_abs_egs >= quantile(max_abs_egs, 0.8, na.rm = TRUE) ~ "Very High",
+      max_abs_egs >= quantile(max_abs_egs, 0.6, na.rm = TRUE) ~ "High",
+      max_abs_egs >= quantile(max_abs_egs, 0.4, na.rm = TRUE) ~ "Moderate",
+      TRUE ~ "Lower"
+    ),
+    size_category = case_when(
+      gene_count >= 50 ~ "Large",
+      gene_count >= 25 ~ "Medium",
+      TRUE ~ "Small"
+    ),
+    stage = case_when(
+      module %in% mods_severe ~ "Severe",
+      module %in% mods_early  ~ "Early",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  column_to_rownames("module")
+
+ann_mod <- ann_mod[rownames(mat_mod), , drop = FALSE]
+
+# Order rows as: Severe Up, Severe Down, Early Up, Early Down, within each by mean EGS
+df_ord <- tibble(module = rownames(mat_mod)) %>%
+  left_join(ann_mod %>% as.data.frame() %>% rownames_to_column("module"), by = "module") %>%
+  mutate(
+    block = case_when(
+      stage=="Severe" & direction=="Upregulated"   ~ 1L,
+      stage=="Severe" & direction=="Downregulated" ~ 2L,
+      stage=="Early"  & direction=="Upregulated"   ~ 3L,
+      stage=="Early"  & direction=="Downregulated" ~ 4L,
+      TRUE ~ 99L
+    ),
+    row_mean = rowMeans(mat_mod[module, , drop = FALSE], na.rm = TRUE)
+  ) %>%
+  arrange(block, desc(row_mean), module)
+
+mat_mod <- mat_mod[df_ord$module, , drop = FALSE]
+ann_mod <- ann_mod[df_ord$module, , drop = FALSE]
+
+n_su <- sum(ann_mod$stage=="Severe" & ann_mod$direction=="Upregulated", na.rm = TRUE)
+n_sd <- sum(ann_mod$stage=="Severe" & ann_mod$direction=="Downregulated", na.rm = TRUE)
+n_eu <- sum(ann_mod$stage=="Early"  & ann_mod$direction=="Upregulated", na.rm = TRUE)
+gaps_mod <- c(n_su, n_su + n_sd, n_su + n_sd + n_eu)
+gaps_mod <- gaps_mod[gaps_mod > 0 & gaps_mod < nrow(mat_mod)]
+if (length(gaps_mod) == 0) gaps_mod <- NULL
+
+bk_mod <- seq(-2, 2, length.out = 101)
+
+p_top <- pheatmap(
+  mat_mod,
+  color = pal_bwr,
+  breaks = bk_mod,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_row = gaps_mod,
+  annotation_row = ann_mod[, c("stage","direction","activity_level","size_category"), drop = FALSE],
+  annotation_colors = annotation_colors_mod,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize = 8,
+  fontsize_row = 7,
+  border_color = "grey70",
+  main = "Combined modules - all conditions (Early vs Severe)",
+  silent = TRUE
+)
+
+# Color rownames by stage (as you wanted)
+stage_rowname_col <- ifelse(ann_mod$stage == "Severe", stage_cols[["Severe"]], stage_cols[["Early"]])
+idx_rn <- which(grepl("row_names", p_top$gtable$layout$name) | grepl("rownames", p_top$gtable$layout$name))
+if (length(idx_rn) >= 1) {
+  idx_rn <- idx_rn[1]
+  rn_grob <- p_top$gtable$grobs[[idx_rn]]
+  if (inherits(rn_grob, "text")) {
+    rn_grob$gp$col <- stage_rowname_col
+    rn_grob$gp$fontface <- "bold"
+    p_top$gtable$grobs[[idx_rn]] <- rn_grob
+  } else if (!is.null(rn_grob$children) && length(rn_grob$children) > 0) {
+    for (k in seq_along(rn_grob$children)) {
+      if (inherits(rn_grob$children[[k]], "text")) {
+        rn_grob$children[[k]]$gp$col <- stage_rowname_col
+        rn_grob$children[[k]]$gp$fontface <- "bold"
+      }
+    }
+    p_top$gtable$grobs[[idx_rn]] <- rn_grob
+  }
+}
+
+# =============================================================================
+# EXPORT PANEL (a): module EGS heatmap only
+# =============================================================================
+# =============================================================================
+# EXPORT UPPER PANEL ONLY (Module EGS heatmap)
+# =============================================================================
+
+stopifnot(exists("p_top"), exists("params"))
+
+out_dir <- file.path(params$results_dir, "Composite_figures")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ---- Vector PDF (BEST for Illustrator) ----
+out_pdf <- file.path(out_dir, "UpperPanel_ModuleEGS_heatmap_AI.pdf")
+
+grDevices::pdf(out_pdf,
+               width = 8,      # adjust if needed
+               height = 10,    # adjust if needed
+               useDingbats = FALSE)
+
+grid::grid.newpage()
+grid::grid.draw(p_top$gtable)
+
+grDevices::dev.off()
+
+cat("Saved upper panel PDF to:\n",
+    normalizePath(out_pdf, winslash = "/"), "\n")
+
+
+# ---- Optional high-resolution TIFF fallback ----
+out_tif <- file.path(out_dir, "UpperPanel_ModuleEGS_heatmap_AI.tiff")
+
+grDevices::tiff(out_tif,
+                width = 8,
+                height = 10,
+                units = "in",
+                res = 600,
+                compression = "lzw")
+
+grid::grid.newpage()
+grid::grid.draw(p_top$gtable)
+
+grDevices::dev.off()
+
+cat("Saved upper panel TIFF to:\n",
+    normalizePath(out_tif, winslash = "/"), "\n")
+```
+
+### Fig 4b: early-module top-5 genes (all conditions, linked to panel a)
+
+```{r fig4b_early_top5_genes, message=FALSE, warning=FALSE, fig.width=14, fig.height=6}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(pheatmap)
+  library(grid)
+  library(gridExtra)
+})
+
+stopifnot(exists("results"), exists("condition_sets"), exists("params"))
+stopifnot(all(c("early","combined") %in% names(results)))
+
+# IMPORTANT: this is what keeps the lower panel linked to the upper
+stopifnot(exists("ann_mod"))
+
+# Same column order as upper heatmap
+desired_order <- c("PKD_wk2","PKD_wk3","PKD_wk6","PKD_Moderate","PKD_Advanced")
+
+pal_bwr <- grDevices::colorRampPalette(c("#4575b4","white","#d73027"))(100)
+k_per_module <- 5
+
+# =============================================================================
+# Pick top-5 genes per EARLY module (rank by max abs log2fc across EARLY conditions)
+# =============================================================================
+gene2mod <- results$early$modules_genes %>%
+  filter(module %in% results$early$modules_sel_ids) %>%
+  select(module, genes) %>%
+  tidyr::unnest_longer(genes) %>%
+  rename(gene_id = genes) %>%
+  distinct(gene_id, module)
+
+df_early <- results$early$data_filtered %>%
+  filter(gene_id %in% gene2mod$gene_id) %>%
+  select(gene_id, condition, log2fc) %>%
+  distinct()
+
+mat_early <- df_early %>%
+  pivot_wider(names_from = condition, values_from = log2fc) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+score_tbl <- tibble(
+  gene_id = rownames(mat_early),
+  score = apply(mat_early, 1, function(x) max(abs(x), na.rm = TRUE))
+)
+
+rank_tbl <- gene2mod %>%
+  inner_join(score_tbl, by = "gene_id") %>%
+  group_by(module) %>%
+  arrange(desc(score), .by_group = TRUE) %>%
+  slice_head(n = k_per_module) %>%
+  ungroup()
+
+genes_keep <- unique(rank_tbl$gene_id)
+
+# =============================================================================
+# Build gene x ALL conditions matrix from COMBINED object, and FORCE SAME col order
+# =============================================================================
+df_all <- results$combined$data_filtered %>%
+  filter(gene_id %in% genes_keep, condition %in% desired_order) %>%
+  mutate(condition = factor(condition, levels = desired_order)) %>%
+  select(gene_id, condition, log2fc) %>%
+  distinct()
+
+mat_all <- df_all %>%
+  pivot_wider(names_from = condition, values_from = log2fc) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+mat_all <- mat_all[, desired_order, drop = FALSE]
+mat_all <- mat_all[rowSums(!is.na(mat_all)) > 0, , drop = FALSE]
+
+gene2mod_for_plot <- rank_tbl %>% select(gene_id, module) %>% distinct()
+gene2mod_for_plot <- gene2mod_for_plot[match(rownames(mat_all), gene2mod_for_plot$gene_id), , drop = FALSE]
+
+keep_ok <- !is.na(gene2mod_for_plot$module)
+mat_all <- mat_all[keep_ok, , drop = FALSE]
+gene2mod_for_plot <- gene2mod_for_plot[keep_ok, , drop = FALSE]
+
+# =============================================================================
+# Module order linked to the upper heatmap EARLY section (top to bottom)
+# =============================================================================
+early_order_top <- rownames(ann_mod)[ann_mod$stage == "Early"]
+mod_present <- unique(gene2mod_for_plot$module)
+
+mod_levels <- early_order_top[early_order_top %in% mod_present]
+mod_levels_extra <- setdiff(mod_present, mod_levels)
+if (length(mod_levels_extra) > 0) mod_levels <- c(mod_levels, mod_levels_extra)
+
+gene2mod_for_plot$module <- factor(gene2mod_for_plot$module, levels = mod_levels)
+
+module_cols <- setNames(grDevices::hcl.colors(length(mod_levels), palette = "Dynamic"), mod_levels)
+
+# =============================================================================
+# Group genes by module; cluster within module
+# =============================================================================
+mat_list <- vector("list", length(mod_levels))
+names(mat_list) <- mod_levels
+
+for (m in mod_levels) {
+  genes_m <- gene2mod_for_plot$gene_id[gene2mod_for_plot$module == m]
+  sub <- mat_all[genes_m, , drop = FALSE]
+  if (nrow(sub) >= 2) {
+    hc <- stats::hclust(stats::dist(sub))
+    sub <- sub[hc$order, , drop = FALSE]
+  }
+  mat_list[[m]] <- sub
+}
+mat_grouped <- do.call(rbind, mat_list)
+
+ann_row_gene <- data.frame(
+  module = factor(
+    gene2mod_for_plot$module[match(rownames(mat_grouped), gene2mod_for_plot$gene_id)],
+    levels = mod_levels
+  ),
+  stringsAsFactors = FALSE
+)
+rownames(ann_row_gene) <- rownames(mat_grouped)
+
+# ONLY requested change: clamp DISPLAY range to -3..3
+bk_gene <- seq(-3, 3, length.out = 101)
+
+# =============================================================================
+# Split into 4 panels (contiguous module blocks)
+# =============================================================================
+n_panels <- 4
+panel_assign <- split(mod_levels, cut(seq_along(mod_levels), breaks = n_panels, labels = FALSE))
+
+make_gene_panel <- function(mod_subset, show_numeric_legend = FALSE) {
+  idx <- which(as.character(ann_row_gene$module) %in% mod_subset)
+  sub_mat <- mat_grouped[idx, , drop = FALSE]
+  sub_ann <- ann_row_gene[idx, , drop = FALSE]
+
+  block_sizes <- vapply(mod_subset, function(mm) sum(as.character(sub_ann$module) == mm), integer(1))
+  gaps <- cumsum(block_sizes)
+  gaps <- gaps[gaps < nrow(sub_mat)]
+
+  pheatmap(
+    sub_mat,
+    color = pal_bwr,
+    breaks = bk_gene,
+    cluster_cols = FALSE,
+    cluster_rows = FALSE,
+    gaps_row = gaps,
+    annotation_row = sub_ann,
+    annotation_colors = list(module = module_cols),
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    fontsize_row = 7,
+    fontsize_col = 9,
+    angle_col = 90,          # straight column names
+    cellwidth = 18,
+    cellheight = 11,
+    border_color = NA,
+    legend = show_numeric_legend,
+    annotation_legend = FALSE,
+    annotation_names_row = FALSE,
+    silent = TRUE
+  )$gtable
+}
+
+gene_gt <- lapply(seq_along(panel_assign), function(i) {
+  make_gene_panel(panel_assign[[i]], show_numeric_legend = (i == length(panel_assign)))
+})
+
+bottom_row <- gridExtra::arrangeGrob(grobs = gene_gt, ncol = 4, widths = rep(1, 4))
+
+grid::grid.newpage()
+grid::grid.draw(bottom_row)
+
+if (isTRUE(params$save_outputs)) {
+  out_dir <- file.path(params$results_dir, "Composite_figures")
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+  out_pdf <- file.path(out_dir, "LowerPanel_EARLYtop5genes_allConditions_clamp-3to3_LINKED.pdf")
+  grDevices::pdf(out_pdf, width = 14, height = 6, useDingbats = FALSE)
+  grid::grid.newpage(); grid::grid.draw(bottom_row)
+  grDevices::dev.off()
+
+  cat("Saved lower panel PDF to:\n", normalizePath(out_pdf, winslash = "/"), "\n")
+}
+```
+
+
+
+## Functional Enrichment Analysis
+
+This step performs pathway enrichment analysis on selected modules using enrichR, filtering for statistically significant terms across multiple databases (GO, KEGG, WikiPathways, MSigDB). Outputs include enrichment tables, barplots for each module, and heatmaps combining module activity with functional annotations.
+
+```{r step2-functional-enrichment, fig.cap="Functional Enrichment Results"}
+
+# =============================================================================
+# STEP 2: FUNCTIONAL ENRICHMENT ANALYSIS
+# =============================================================================
+
+# ——— Enrichment parameters ———
+min_module_genes       <- 10
+min_pathway_size       <- 5
+max_pathway_size       <- 500
+min_intersection_ratio <- 0.2
+pvalue_threshold       <- 0.05
+
+setEnrichrSite("Enrichr")
+
+# Select databases
+preferred_databases <- c(
+  "GO_Biological_Process_2025",
+  "KEGG_2026",
+  "WikiPathways_2024_Mouse",
+  "Reactome_Pathways_2024",
+  "MSigDB_Hallmark_2020"
+)
+
+available_databases <- intersect(preferred_databases,
+                                 listEnrichrDbs()$libraryName)
+stopifnot(length(available_databases) > 0)
+
+# ——— Fixed color mapping (publication-consistent) ———
+db_colors <- c(
+  GO_Biological_Process_2025 = "#0072B2",  # blue
+  KEGG_2026                  = "#E69F00",  # orange
+  MSigDB_Hallmark_2020       = "#009E73",  # green
+  Reactome_Pathways_2024     = "#D55E00",  # vermillion
+  WikiPathways_2024_Mouse    = "#CC79A7"   # purple
+)
+
+# ——— Function definition ———
+perform_module_enrichment <- function(gene_list, module_name, databases) {
+
+  if (length(gene_list) < min_module_genes) return(NULL)
+
+  tryCatch({
+
+    enr <- enrichr(gene_list, databases)
+    out <- data.frame()
+
+    for (db in names(enr)) {
+
+      df <- enr[[db]]
+      if (is.null(df) || nrow(df) == 0) next
+
+      df2 <- df %>%
+        mutate(
+          module                    = module_name,
+          database                  = db,
+          gene_count                = length(gene_list),
+          intersection_size         = sapply(
+                                        Genes,
+                                        function(x) length(strsplit(x, ";")[[1]])
+                                      ),
+          min_intersection_required = ceiling(
+                                        length(gene_list) *
+                                        min_intersection_ratio
+                                      )
+        ) %>%
+        filter(
+          intersection_size >= min_pathway_size,
+          intersection_size <= max_pathway_size,
+          intersection_size >= min_intersection_required,
+          P.value < pvalue_threshold
+        ) %>%
+        select(
+          module, database, gene_count, Term, P.value,
+          Adjusted.P.value, Combined.Score,
+          Genes, intersection_size, min_intersection_required
+        )
+
+      if (nrow(df2) > 0) out <- bind_rows(out, df2)
+    }
+
+    if (nrow(out) == 0) NULL else out
+
+  }, error = function(e) NULL)
+}
+
+# ——— Prepare output directory ———
+union_out_dir <- file.path(params$results_dir, "enrichment_union")
+if (!dir.exists(union_out_dir))
+  dir.create(union_out_dir, recursive = TRUE)
+
+# ——— Build union of module gene lists ———
+union_modules <- bind_rows(
+  results$early$modules_genes,
+  results$advanced$modules_genes,
+  results$combined$modules_genes
+) %>%
+  distinct(module, .keep_all = TRUE)
+
+# ——— Run enrichment ———
+all_enrichments <- data.frame()
+enrichment_list <- list()
+
+for (i in seq_len(nrow(union_modules))) {
+
+  mod   <- union_modules$module[i]
+  genes <- union_modules$genes[[i]]
+
+  res <- perform_module_enrichment(
+    genes,
+    mod,
+    available_databases
+  )
+
+  if (!is.null(res)) {
+    enrichment_list[[mod]] <- res
+    all_enrichments        <- bind_rows(all_enrichments, res)
+  }
+}
+
+# ——— Annotation ———
+annotations_union <- union_modules %>%
+  select(module, gene_count = gene_count_check) %>%
+  left_join(
+    all_enrichments %>%
+      group_by(module) %>%
+      slice_min(P.value, n = 1) %>%
+      transmute(
+        module,
+        top_term              = Term,
+        best_pvalue           = P.value,
+        top_intersection_size = intersection_size,
+        top_database          = database
+      ) %>%
+      mutate(
+        has_enrichment     = "Yes",
+        significance_level = case_when(
+          best_pvalue < 0.001 ~ "Very High",
+          best_pvalue < 0.01  ~ "High",
+          best_pvalue < 0.05  ~ "Moderate",
+          TRUE                ~ "Lower"
+        )
+      ),
+    by = "module"
+  ) %>%
+  replace_na(list(
+    has_enrichment        = "No",
+    significance_level    = "None",
+    top_intersection_size = 0
+  ))
+
+results$union_enrichment <- list(
+  enrichments = enrichment_list,
+  annotations = annotations_union,
+  plots       = list()
+)
+
+# =============================================================================
+# Generate & Save Per-Module Plots
+# =============================================================================
+
+for (mod in names(enrichment_list)) {
+
+  df <- enrichment_list[[mod]]
+
+  # ---- Top 12 Overall ----
+  top_overall <- df %>%
+    arrange(desc(Combined.Score)) %>%
+    slice_head(n = 12) %>%
+    mutate(
+      neg_log_p = -log10(P.value),
+      term_short = ifelse(
+        nchar(Term) > 50,
+        paste0(substr(Term, 1, 47), "..."),
+        Term
+      )
+    )
+
+  p1 <- ggplot(
+    top_overall,
+    aes(reorder(term_short, neg_log_p),
+        neg_log_p,
+        fill = database)
+  ) +
+    geom_col(color = "black", linewidth = 0.3) +
+    scale_fill_manual(values = db_colors, drop = FALSE) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = paste("Top12 Overall —", mod),
+         x = NULL,
+         y = "-log10(p)")
+
+  # ---- Top 3 Per DB ----
+  top_db <- df %>%
+    group_by(database) %>%
+    arrange(P.value) %>%
+    slice_head(n = 3) %>%
+    ungroup() %>%
+    mutate(
+      neg_log_p = -log10(P.value),
+      term_short = ifelse(
+        nchar(Term) > 50,
+        paste0(substr(Term, 1, 47), "..."),
+        Term
+      )
+    )
+
+  p2 <- ggplot(
+    top_db,
+    aes(reorder(term_short, neg_log_p),
+        neg_log_p,
+        fill = database)
+  ) +
+    geom_col(color = "black", linewidth = 0.3) +
+    scale_fill_manual(values = db_colors, drop = FALSE) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top3 per DB",
+         x = NULL,
+         y = "-log10(p)")
+
+  # ---- DB Summary ----
+  db_sum <- df %>%
+    group_by(database) %>%
+    summarise(terms = n(), .groups = "drop")
+
+  p3 <- ggplot(
+    db_sum,
+    aes(database, terms, fill = database)
+  ) +
+    geom_col(color = "black", linewidth = 0.3) +
+    scale_fill_manual(values = db_colors, drop = FALSE) +
+    theme_minimal() +
+    labs(title = "DB Summary",
+         x = NULL,
+         y = "Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+
+  combo <- p1 / p2 / p3
+
+  results$union_enrichment$plots[[mod]] <- combo
+
+  ggsave(
+    file.path(union_out_dir,
+              paste0("enrichment_", mod, ".png")),
+    combo,
+    width = 8,
+    height = 12,
+    dpi = 150
+  )
+}
+
+# =============================================================================
+# FIGURE 5 — Top 10 Overall Pathways (6 Modules)
+# =============================================================================
+
+modules_of_interest <- c(
+  "rKIDNEY_33",
+  "rKIDNEY_28m",
+  "rKIDNEY_64m",
+  "rKIDNEY_29",
+  "rKIDNEY_96m",
+  "rKIDNEY_124"
+)
+
+plot_top10_overall <- function(df, module_name) {
+
+  df_top10 <- df %>%
+    arrange(desc(Combined.Score)) %>%
+    slice_head(n = 10) %>%
+    mutate(
+      neg_log_p = -log10(P.value),
+      term_short = ifelse(
+        nchar(Term) > 60,
+        paste0(substr(Term, 1, 57), "..."),
+        Term
+      )
+    )
+
+  ggplot(
+    df_top10,
+    aes(reorder(term_short, neg_log_p),
+        neg_log_p,
+        fill = database)
+  ) +
+    geom_col(color = "black", linewidth = 0.4) +
+    scale_fill_manual(values = db_colors, drop = FALSE) +
+    coord_flip() +
+    theme_minimal(base_size = 15) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 18, face = "bold")
+    ) +
+    labs(title = module_name,
+         x = NULL,
+         y = "-log10(p)")
+}
+
+plot_list <- lapply(modules_of_interest, function(mod) {
+  df <- results$union_enrichment$enrichments[[mod]]
+  if (!is.null(df) && nrow(df) > 0)
+    plot_top10_overall(df, mod)
+  else
+    ggplot() + theme_void() + labs(title = paste(mod, "(no enrichment)"))
+})
+
+names(plot_list) <- modules_of_interest
+
+final_plot <- (
+  plot_list[[1]] | plot_list[[2]]
+) / (
+  plot_list[[3]] | plot_list[[4]]
+) / (
+  plot_list[[5]] | plot_list[[6]]
+)
+
+ggsave(
+  file.path(union_out_dir,
+            "Top10_overall_6modules_NOLEGEND.png"),
+  final_plot,
+  width = 14,
+  height = 18,
+  dpi = 300
+)
+
+```
+
+
+
+## TF Enrichment Analysis
+
+This step performs transcription factor enrichment analysis using TRRUST database, identifying TFs significantly enriched in each module through hypergeometric testing. Outputs include TF enrichment tables, frequency plots, static and interactive bipartite networks showing TF-module regulatory relationships, and hub TF identification.
+
+```{r step3-tf-enrichment, fig.cap="TF Enrichment Analysis Results"}
+# =============================================================================
+# STEP 3: TF ENRICHMENT ANALYSIS (MAIN AND COMBINED)
+# =============================================================================
+
+# === PARAMETERS ===
+min_tf_targets            <- 1
+min_intersection_required <- 2
+min_fold_enrichment       <- 1.5
+fdr_threshold             <- 0.10
+
+# === BACKGROUND ===
+background_genes <- unique(results$combined$data_filtered$gene_id)
+
+# === MODULE SELECTION ===
+selected_modules <- results$combined$modules_sel_ids
+modules_genes <- results$combined$modules_genes %>%
+  filter(module %in% selected_modules)
+
+# === TRRUST FILTER ===
+tf_regulons <- read_tsv(trrust_file, col_names = c("TF", "Target", "Mode", "PMID"), show_col_types = FALSE)
+tf_regulons <- tf_regulons %>%
+  filter(Target %in% background_genes)
+
+# === FUNCTION ===
+perform_tf_enrichment <- function(module_genes, tf_regulons, background_genes) {
+  results <- list()
+  for (tf in unique(tf_regulons$TF)) {
+    targets <- tf_regulons %>% filter(TF == tf) %>% pull(Target) %>% unique()
+    if (length(targets) < min_tf_targets) next
+
+    overlap <- intersect(module_genes, targets)
+    if (length(overlap) < min_intersection_required) next
+
+    m <- length(intersect(targets, background_genes))
+    N <- length(background_genes)
+    k <- length(module_genes)
+    x <- length(overlap)
+
+    pval     <- phyper(x - 1, m, N - m, k, lower.tail = FALSE)
+    expected <- (k * m) / N
+    fold     <- x / max(expected, 1)
+    if (fold < min_fold_enrichment) next
+
+    modes <- tf_regulons %>% filter(TF == tf, Target %in% overlap) %>% pull(Mode)
+    dommode <- if (all(c("Activation", "Repression") %in% modes)) "Mixed"
+      else if ("Activation" %in% modes) "Activation"
+      else if ("Repression" %in% modes) "Repression"
+      else "Unknown"
+
+    pmids <- tf_regulons %>% filter(TF == tf, Target %in% overlap) %>% pull(PMID) %>% unique()
+
+    results[[tf]] <- data.frame(
+      TF                = tf,
+      overlap_count     = x,
+      module_size       = k,
+      tf_targets_total  = m,
+      expected_overlap  = expected,
+      fold_enrichment   = fold,
+      pvalue            = pval,
+      dominant_mode     = dommode,
+      pmid_count        = length(pmids),
+      overlapping_genes = paste(overlap, collapse = ";"),
+      stringsAsFactors  = FALSE
+    )
+  }
+  if (length(results) == 0) return(NULL)
+  df <- bind_rows(results)
+  df$fdr <- p.adjust(df$pvalue, method = "fdr")
+  df <- df %>%
+    filter(fdr <= fdr_threshold)
+  return(df)
+}
+
+# === RUN ===
+tf_enrich_combined <- list()
+
+for (mod in selected_modules) {
+  genes <- modules_genes %>% filter(module == mod) %>% pull(genes) %>% .[[1]]
+  df <- perform_tf_enrichment(genes, tf_regulons, background_genes)
+  if (!is.null(df)) {
+    tf_enrich_combined[[mod]] <- df %>% mutate(module = mod)
+  }
+}
+
+# === STORE ===
+results$combined$tf_enrichments <- tf_enrich_combined
+
+# === FLATTEN + FILTER ===
+tf_df <- bind_rows(tf_enrich_combined)
+significant_tf_enrichments <- tf_df %>%
+  filter(fdr <= fdr_threshold, overlap_count >= min_intersection_required)
+
+# === NETWORK DATA ===
+max_modules <- 12
+max_tfs_per_module <- 8
+
+top_modules <- significant_tf_enrichments %>%
+  count(module, name = "n_tfs") %>%
+  arrange(desc(n_tfs)) %>%
+  slice_head(n = max_modules) %>%
+  pull(module)
+
+network_data <- significant_tf_enrichments %>%
+  filter(module %in% top_modules) %>%
+  group_by(module) %>%
+  arrange(desc(fold_enrichment)) %>%
+  slice_head(n = max_tfs_per_module) %>%
+  ungroup() %>%
+  transmute(
+    from         = TF,
+    to           = module,
+    weight       = fold_enrichment,
+    edge_mode    = dominant_mode,
+    module_label = sub(".*:", "", module)
+  )
+
+tf_module_membership <- expand.grid(
+  TF     = unique(network_data$from),
+  module = modules_genes$module,
+  stringsAsFactors = FALSE
+) %>%
+  rowwise() %>%
+  mutate(
+    gene_list = list(modules_genes$genes[modules_genes$module == module][[1]]),
+    is_member = TF %in% gene_list[[1]]
+  ) %>%
+  ungroup() %>%
+  filter(is_member) %>%
+  group_by(TF) %>%
+  summarise(
+    member_modules = paste(gsub(".*[:|]", "", module), collapse = ","),
+    .groups = "drop"
+  )
+
+
+# === BUILD GRAPH ===
+g <- igraph::graph_from_data_frame(network_data, directed = FALSE)
+igraph::V(g)$type <- igraph::V(g)$name %in% network_data$from
+igraph::V(g)$label <- ifelse(
+  igraph::V(g)$type,
+  igraph::V(g)$name,
+  network_data$module_label[match(igraph::V(g)$name, network_data$to)]
+)
+igraph::V(g)$member_modules <- ifelse(
+  igraph::V(g)$type & igraph::V(g)$name %in% tf_module_membership$TF,
+  tf_module_membership$member_modules[match(igraph::V(g)$name, tf_module_membership$TF)],
+  ""
+)
+igraph::V(g)$fill <- ifelse(
+  igraph::V(g)$type,
+  "grey80",
+  ifelse(
+    results$combined$modules_selected$direction[match(igraph::V(g)$name, results$combined$modules_selected$module)] == "Upregulated",
+    "#d73027", "#4575b4"
+  )
+)
+igraph::E(g)$edge_mode <- network_data$edge_mode
+igraph::E(g)$weight <- network_data$weight
+
+# === LAYOUT ===
+layout_mat <- igraph::layout_as_bipartite(g, types = igraph::V(g)$type)
+tfi  <- which(igraph::V(g)$type)
+modi <- which(!igraph::V(g)$type)
+layout_mat[tfi,1]  <- seq(-5, 5, length.out = length(tfi))
+layout_mat[modi,1] <- seq(-4, 4, length.out = length(modi))
+layout_mat[tfi,2]  <-  1
+layout_mat[modi,2] <- -1
+
+# === PLOT ===
+
+
+p <- ggraph(g, layout = "manual", x = layout_mat[,1], y = layout_mat[,2]) +
+  geom_edge_link(aes(edge_colour = edge_mode, edge_width = weight), alpha = 0.8) +
+  geom_node_point(aes(fill = fill), shape = 21, size = 5, colour = "black") +
+  geom_node_text(aes(label = label), repel = TRUE, size = 3) +
+  geom_node_text(aes(label = ifelse(member_modules != "", member_modules, "")),
+                 size = 2.5, colour = "white", fontface = "bold") +
+  scale_edge_color_manual(
+    values = c(
+      Activation = "#d73027",
+      Repression = "#4575b4",
+      Mixed = "#8B008B",
+      Unknown = "grey60"
+    ),
+    name = "Regulation"
+  ) +
+  scale_edge_width(name = "Fold Enrichment") +
+  scale_fill_identity() +
+  theme_void() +
+  ggtitle("TF–Module Bipartite Network (Combined Selection)")
+
+# === SAVE PLOT ===
+ggsave(
+  file.path(params$results_dir, "tf_module_bipartite_combined.png"),
+  plot = p,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+
+
+# === PREPARE MAIN TABLE: one row per TF–Module edge in network ===
+main_table <- network_data %>%
+  rename(TF = from, Module = to, Fold_Enrichment = weight, Edge_Mode = edge_mode) %>%
+  mutate(Module_Label = sub(".*:", "", Module)) %>%
+  # TRUE TF–module membership calculated by unnesting module gene lists
+  left_join(
+    modules_genes %>%
+      unnest_longer(genes) %>%
+      rename(TF = genes, Module_Label = module) %>%
+      mutate(Is_TF_Module_Member = TRUE),
+    by = c("TF", "Module_Label")
+  ) %>%
+  mutate(Is_TF_Module_Member = replace_na(Is_TF_Module_Member, FALSE)) %>%
+  select(TF, Module, Module_Label, Fold_Enrichment, Edge_Mode, Is_TF_Module_Member) %>%
+  arrange(Module_Label, desc(Fold_Enrichment))
+
+# === ADD EXTRA COLUMNS from enrichment stats ===
+df_enrich <- bind_rows(tf_enrich_combined, .id = "Module") %>%
+  mutate(Module_Label = sub(".*:", "", Module)) %>%
+  select(
+    Module_Label, TF,
+    Overlap_Count = overlap_count,
+    TF_Targets_Total = tf_targets_total,
+    Expected_Overlap = expected_overlap,
+    Pvalue = pvalue,
+    FDR = fdr,
+    Dominant_Mode = dominant_mode,
+    Overlapping_Genes = overlapping_genes
+  )
+
+# === MERGE into one master table ===
+final_table <- main_table %>%
+  left_join(df_enrich, by = c("Module_Label", "TF")) %>%
+  select(
+    TF,
+    Module_Label,
+    Fold_Enrichment,
+    Overlap_Count,
+    TF_Targets_Total,
+    Expected_Overlap,
+    FDR,
+    Edge_Mode,
+    Dominant_Mode,
+    Overlapping_Genes,
+    Is_TF_Module_Member
+  )
+
+# === WRITE TO ONE EXCEL FILE ===
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb, "TF_Module_Bipartite_Network")
+openxlsx::writeData(wb, "TF_Module_Bipartite_Network", final_table)
+
+out_path <- file.path(params$results_dir, "tf_module_bipartite_summary.xlsx")
+openxlsx::saveWorkbook(wb, out_path, overwrite = TRUE)
+
+
+```
+
+###fig 6 
+
+```{r chord_export_both, message=FALSE, warning=FALSE}
+
+library(circlize)
+library(dplyr)
+
+# --------------------------------------------------
+# PREPARE chord_df WITH ALL TFs (no filtering)
+# --------------------------------------------------
+chord_df <- network_data %>%
+  mutate(
+    TF     = from,
+    Module = to,
+    Weight = weight,
+    Mode   = edge_mode
+  ) %>%
+  select(TF, Module, Weight, Mode)
+
+TFs     <- unique(chord_df$TF)
+Modules <- unique(chord_df$Module)
+
+# Module colors
+module_cols_raw <- ifelse(
+  results$combined$modules_selected$direction[
+    match(Modules, results$combined$modules_selected$module)
+  ] == "Upregulated",
+  "#FF0000",   # red
+  "#0072B2"    # blue
+)
+names(module_cols_raw) <- Modules
+
+# TF colors
+tf_cols_raw <- rep("#BBBBBB", length(TFs))
+names(tf_cols_raw) <- TFs
+
+group_colors <- c(tf_cols_raw, module_cols_raw)
+
+# Edge colors (soft)
+edge_color_map <- c(
+  Activation = "#FF0000",
+  Repression = "#0072B2",
+  Mixed      = "#800080",
+  Unknown    = "#777777"
+)
+chord_df$col <- adjustcolor(edge_color_map[chord_df$Mode], alpha.f = 0.30)
+
+
+
+# ==================================================
+# FUNCTION: Draw chord diagram with no labels
+# ==================================================
+draw_chord_nolabels <- function() {
+  circos.clear()
+  circos.par(start.degree=90, gap.degree=2, track.margin=c(0.02,0.02))
+
+  chordDiagram(
+    chord_df[,c("TF","Module","Weight","col")],
+    grid.col = group_colors,
+    transparency = 0.70,
+    directional = 0,
+    annotationTrack = "grid",
+    annotationTrackHeight = mm_h(4),
+    link.sort = TRUE,
+    link.largest.ontop = TRUE,
+    col = chord_df$col
+  )
+
+  circos.track(
+    track.index=1,
+    ylim=c(0,1),
+    bg.border=NA,
+    panel.fun=function(x,y){}
+  )
+}
+
+# ==================================================
+# FUNCTION: Draw chord diagram with ALL RADIAL LABELS
+# ==================================================
+draw_chord_radial <- function() {
+  circos.clear()
+  circos.par(start.degree=90, gap.degree=2, track.margin=c(0.02,0.02))
+
+  chordDiagram(
+    chord_df[,c("TF","Module","Weight","col")],
+    grid.col = group_colors,
+    transparency = 0.65,
+    directional = 0,
+    annotationTrack = "grid",
+    annotationTrackHeight = mm_h(4),
+    link.sort = TRUE,
+    link.largest.ontop = TRUE,
+    col = chord_df$col
+  )
+
+  # Replace labels with radial labels for ALL sectors
+  circos.trackPlotRegion(
+    track.index=1,
+    ylim=c(0,1),
+    bg.border = NA,
+    panel.fun = function(x,y){
+      circos.text(
+        CELL_META$xcenter,
+        CELL_META$ylim[1] - 0.30,
+        CELL_META$sector.index,
+        facing="clockwise",
+        niceFacing=TRUE,
+        adj=c(0.5,-0.2),
+        cex=1.2,
+        font=2
+      )
+    }
+  )
+}
+
+# ==================================================
+# EXPORT BOTH VERSIONS
+# ==================================================
+
+# Output paths
+png_radial <- file.path(params$results_dir, "TF_Module_Chord_Radial.png")
+png_nolabel <- file.path(params$results_dir, "TF_Module_Chord_NoLabels.png")
+
+svg_radial <- file.path(params$results_dir, "TF_Module_Chord_Radial.svg")
+svg_nolabel <- file.path(params$results_dir, "TF_Module_Chord_NoLabels.svg")
+
+eps_radial <- file.path(params$results_dir, "TF_Module_Chord_Radial.eps")
+eps_nolabel <- file.path(params$results_dir, "TF_Module_Chord_NoLabels.eps")
+
+
+# PNG export
+png(png_radial, width=2800, height=2800, res=300)
+draw_chord_radial()
+dev.off()
+
+png(png_nolabel, width=2800, height=2800, res=300)
+draw_chord_nolabels()
+dev.off()
+
+# SVG export
+svg(svg_radial, width=12, height=12)
+draw_chord_radial()
+dev.off()
+
+svg(svg_nolabel, width=12, height=12)
+draw_chord_nolabels()
+dev.off()
+
+# EPS export
+setEPS()
+postscript(eps_radial, width=12, height=12)
+draw_chord_radial()
+dev.off()
+
+setEPS()
+postscript(eps_nolabel, width=12, height=12)
+draw_chord_nolabels()
+dev.off()
+
+cat("Export complete:\n",
+    png_radial, "\n",
+    png_nolabel, "\n",
+    svg_radial, "\n",
+    svg_nolabel, "\n",
+    eps_radial, "\n",
+    eps_nolabel, "\n")
+
+```
+
+```{r sensitivity-percentile}
+
+# Sensitivity analysis: key module retention at 80th, 85th, 90th percentile
+key_modules <- c("rKIDNEY_33", "rKIDNEY_124", "rKIDNEY_28m", "rKIDNEY_29", "rKIDNEY_64m", "rKIDNEY_103")
+
+new_wgcna_raw <- read_csv(wgcna_file)
+
+sensitivity_results <- lapply(c(0.80, 0.85, 0.90), function(pct) {
+  df <- clean_wgcna_data(new_wgcna_raw, condition_sets$early)
+  stats <- analyze_modules(df, pct, min_gene_count, min_conditions)
+  sel <- stats %>% filter(selected) %>% pull(module)
+  
+  data.frame(
+    percentile = pct,
+    n_modules_selected = length(sel),
+    key_modules_retained = paste(key_modules[key_modules %in% sel], collapse = "; "),
+    all_key_retained = all(key_modules %in% sel)
+  )
+})
+
+sensitivity_df <- bind_rows(sensitivity_results)
+print(sensitivity_df)
+```
+
