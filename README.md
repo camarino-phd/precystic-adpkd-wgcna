@@ -3,15 +3,15 @@
 Analysis code for *"Weighted Co-expression Reveals Early Circadian and Metabolic
 Dysregulation in Precystic Kidneys"* (Marino, Kunnen, van de Water, Peters).
 
-The pipeline projects staged *Pkd1* conditional-knockout mouse RNA-seq
-(log2 fold changes) onto the 347 curated rat kidney co-expression modules of the
-TXG-MAPr framework, selects transcriptionally active modules, and performs
-functional and transcription-factor enrichment.
+The pipeline takes staged *Pkd1* conditional-knockout mouse RNA-seq (gene-level
+log2 fold changes), projects them onto the 347 curated rat kidney co-expression
+modules of the TXG-MAPr framework, selects transcriptionally active modules, and
+runs functional and transcription-factor enrichment on the selected set.
 
-> **Eigengene scores are not computed in this repository.** They are computed by
-> the TXG-MAPr web tool (https://txg-mapr.eu). Script 01 produces the upload
-> file; the platform returns `moduleTable.txt` and `geneTable.txt`; script 02
-> reads those back in. See the run order below.
+Eigengene scores are not computed in this repository. They are computed by the
+TXG-MAPr web tool (https://txg-mapr.eu). Script 01 produces the upload file, the
+platform returns `moduleTable.txt` and `geneTable.txt`, and script 02 reads those
+back in. The one manual web step sits between scripts 01 and 02 (see Run order).
 
 ## Repository structure
 
@@ -30,36 +30,37 @@ functional and transcription-factor enrichment.
 
 ## Requirements
 
-R (>= 4.0). All dependencies are on CRAN. Run `code/00_environment.R` first; it
+R (>= 4.0). All dependencies are on CRAN. Run `code/00_environment.R` first. It
 installs anything missing and prints `sessionInfo()` for the exact versions used.
 
-Open `precystic-adpkd-wgcna.Rproj` in RStudio before running anything, or make
-sure the working directory is the repository root. The scripts locate inputs and
-outputs with `here`, which anchors on the `.here` file (or the `.Rproj`) at the
-repository root; running from elsewhere fails with a "could not find associated
-project" error.
+Open `precystic-adpkd-wgcna.Rproj` in RStudio before running anything, or set the
+working directory to the repository root. The scripts resolve input and output
+paths with `here`, which anchors on the `.here` file (or the `.Rproj`) at the root.
+Running from any other directory fails with a "could not find associated project"
+error.
 
 ## Run order
 
-Scripts are numbered in execution order. There is one **manual step on the
-TXG-MAPr website between 01 and 02** that cannot be automated.
+Scripts are numbered in execution order. One manual step on the TXG-MAPr website,
+between 01 and 02, cannot be automated.
 
-1. **`00_environment.R`** — load packages.
-2. **`01_prepare_upload.Rmd`** — reads the mouse log2FC tables, maps mouse to rat
+1. `00_environment.R`: load packages.
+2. `01_prepare_upload.Rmd`: reads the mouse log2FC tables, maps mouse to rat
    orthologs, and writes the TXG-MAPr upload file
-   `results/<date>/txg_mapr_upload_rat_symbols.txt`.
-   Also produces the DEG counts (Table 1), the ortholog mapping summary
-   (Supplementary Table 2), and the volcano plots (Figure 2).
-3. **Manual TXG-MAPr step.** Log in to https://txg-mapr.eu, upload
+   `results/<date>/txg_mapr_upload_rat_symbols.txt`. Also produces the DEG counts
+   (Table 1), the ortholog mapping summary (Supplementary Table 2), and the
+   volcano plots (Figure 2).
+3. Manual TXG-MAPr step: log in to https://txg-mapr.eu, upload
    `txg_mapr_upload_rat_symbols.txt`, run the projection, download the result
    archive, and unzip it to `data/TXG-MAPr_Results_Unzipped/` so that
    `moduleTable.txt` and `geneTable.txt` are present.
-4. **`02_assemble_egs_matrix.Rmd`** — joins the platform output with the ortholog
-   table and writes the gene × module × condition eigengene-score matrix
+4. `02_assemble_egs_matrix.Rmd`: joins the platform output with the ortholog table
+   and writes the gene × module × condition eigengene-score matrix
    `data/new_wgcna.csv` / `.xlsx` (Supplementary Table 3).
-5. **`03_analysis_and_figures.Rmd`** — module selection (85th-percentile EGS
-   filter), functional enrichment (Enrichr), TF enrichment (TRRUST-v2), the
-   percentile sensitivity analysis, and Figures 4, 5, and 6.
+5. `03_analysis_and_figures.Rmd`: module selection (85th-percentile EGS filter),
+   functional enrichment (Enrichr), TF enrichment (TRRUST-v2), the percentile
+   robustness check across the 80th to 90th percentile range, and Figures 4, 5,
+   and 6.
 
 ## Output map (figures and tables)
 
@@ -75,35 +76,28 @@ TXG-MAPr website between 01 and 02** that cannot be automated.
 | Figure 6 (TF-module chord diagram) | 03 |
 | Supplementary Table 4 (ORA per module) | 03 |
 | Supplementary Tables 5–6 (TF-module enrichment) | 03 |
-| Percentile sensitivity analysis | 03 |
+| Percentile robustness check | 03 |
 
-Figures 1, 3, and 8 are not generated here: Figure 1 and Supplementary Figure 1
-are workflow schematics, and the circular dendrograms (Figures 3 and 8) are
-exported from the TXG-MAPr platform.
+Figures 1, 3, and 8 are not generated here. Figure 1 and Supplementary Figure 1
+are workflow schematics. The circular dendrograms (Figures 3 and 8) are exported
+from the TXG-MAPr platform.
 
 ## Data provenance
 
-Place the following under `data/`. Third-party inputs are redistributed only
-where their licence allows; otherwise obtain them from the listed source.
+Place the following files under `data/`. Third-party inputs are redistributed only
+where their licence allows. Otherwise, obtain them from the listed source.
 
 | File | Source | Notes |
 | --- | --- | --- |
-| `earlyPKDmodels.xlsx` | Precystic (wk2/3/6) log2FC, Kunnen et al. 2018 (*Biomed Pharmacother*) Suppl. Table S9 | authors' own prior work |
-| `Pkd1cko_NoRapa_WT.xlsx` | Moderate/advanced log2FC, Malas et al. 2020 (*EBioMedicine*) | authors' own prior work; raw data ArrayExpress **E-MTAB-8086** |
+| `earlyPKDmodels.xlsx` | Precystic (wk2/3/6) log2FC. Provided as Supplementary Table 1 (early-stage sheet) of this manuscript; original values from Kunnen et al. 2018 (*Biomed Pharmacother*) Suppl. Table S9 | authors' own work |
+| `Pkd1cko_NoRapa_WT.xlsx` | Moderate/advanced log2FC. Provided as Supplementary Table 1 (moderate/advanced sheet) of this manuscript; raw data ArrayExpress **E-MTAB-8086** (Malas et al. 2020) | authors' own work |
 | `ORTHOLOGS_RAT.txt` | Rat Genome Database (RGD) ortholog table, release 2025-07-26 | cite RGD; verify redistribution terms |
 | `trrust_rawdata.mouse.tsv` | TRRUST v2 (Han et al. 2018) | CC-BY; redistribute with citation |
-| `TXG-MAPr_Results_Unzipped/moduleTable.txt`, `geneTable.txt` | Generated via TXG-MAPr from the script-01 upload | your projection output |
+| `TXG-MAPr_Results_Unzipped/moduleTable.txt`, `geneTable.txt` | Generated via TXG-MAPr from the script-01 upload | projection output |
 
 Raw RNA-seq: ArrayExpress **E-MTAB-8086**. Reference network: TXG-MAPr
 (https://txg-mapr.eu; Kunnen et al. 2025, *iScience*, and Zenodo
 https://doi.org/10.5281/zenodo.14926143).
-
-> **Open point, to confirm before final release.** The two derived log2FC tables
-> (`earlyPKDmodels.xlsx`, `Pkd1cko_NoRapa_WT.xlsx`) are bundled here for
-> convenience, but redistribution of these tables has not yet been cleared with
-> the PI / LUMC data steward against the terms of the original publications. If it
-> turns out they cannot be redistributed, drop the files and regenerate them from
-> the sources above (Kunnen et al. 2018 Suppl. Table S9; E-MTAB-8086).
 
 ## License
 
@@ -112,6 +106,5 @@ Marino (see `LICENSE`).
 
 ## Citation
 
-Marino CA, Kunnen SJ, van de Water B, Peters DJM. *Weighted Co-expression
-Reveals Early Circadian and Metabolic Dysregulation in Precystic Kidneys.*
-(add journal / DOI on acceptance; add the Zenodo software DOI here.)
+Marino CA, Kunnen SJ, van de Water B, Peters DJM. *Weighted Co-expression Reveals
+Early Circadian and Metabolic Dysregulation in Precystic Kidneys.* To fill
