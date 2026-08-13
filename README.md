@@ -107,4 +107,4 @@ Marino (see `LICENSE`).
 ## Citation
 
 Marino CA, Kunnen SJ, van de Water B, Peters DJM. *Weighted Co-expression Reveals
-Early Circadian and Metabolic Dysregulation in Precystic Kidneys.* To fill
+Early Circadian and Metabolic Dysregulation in Precystic Kidneys.* https://doi.org/10.5281/zenodo.21924061
